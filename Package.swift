@@ -11,9 +11,21 @@
 */
 
 import PackageDescription
+import class Foundation.ProcessInfo
+
+// We default to a 10.10 minimum deployment target for clients of libSwiftPM,
+// but allow overriding it when building for a toolchain.
+
+let macOSPlatform: SupportedPlatform
+if let deploymentTarget = ProcessInfo.processInfo.environment["SWIFTPM_MACOS_DEPLOYMENT_TARGET"] {
+    macOSPlatform = .macOS(deploymentTarget)
+} else {
+    macOSPlatform = .macOS(.v10_10)
+}
 
 let package = Package(
     name: "SwiftPM",
+    platforms: [macOSPlatform],
     products: [
         // The `libSwiftPM` set of interfaces to programatically work with Swift
         // packages.
@@ -47,6 +59,11 @@ let package = Package(
                 "Xcodeproj",
                 "Workspace"
             ]
+        ),
+
+        .library(
+            name: "XCBuildSupport",
+            targets: ["XCBuildSupport"]
         ),
 
         .library(
@@ -110,7 +127,7 @@ let package = Package(
         .target(
             /** Builds Modules and Products */
             name: "Build",
-            dependencies: ["SwiftToolsSupport-auto", "SPMBuildCore", "PackageGraph", "LLBuildManifest"]),
+            dependencies: ["SwiftToolsSupport-auto", "SPMBuildCore", "PackageGraph", "LLBuildManifest", "SwiftDriver"]),
         .target(
             /** Support for building using Xcode's build system */
             name: "XCBuildSupport",
@@ -150,7 +167,10 @@ let package = Package(
         .target(
             /** Shim tool to find test names on OS X */
             name: "swiftpm-xctest-helper",
-            dependencies: []),
+            dependencies: [],
+            linkerSettings: [
+                .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../../../lib/swift/macosx"], .when(platforms: [.macOS])),
+            ]),
 
         // MARK: Additional Test Dependencies
 
@@ -204,6 +224,13 @@ let package = Package(
         .testTarget(
             name: "XCBuildSupportTests",
             dependencies: ["XCBuildSupport", "SPMTestSupport"]),
+
+        // Examples (These are built to ensure they stay up to date with the API.)
+        .target(
+            name: "package-info",
+            dependencies: ["PackageModel", "PackageLoading", "PackageGraph", "Workspace"],
+            path: "Examples/package-info/Sources/package-info"
+        )
     ],
     swiftLanguageVersions: [.v5]
 )
@@ -217,7 +244,6 @@ let package = Package(
 // package dependency like this but there is no other good way of expressing
 // this right now.
 
-import class Foundation.ProcessInfo
 
 if ProcessInfo.processInfo.environment["SWIFTPM_LLBUILD_FWK"] == nil {
     if ProcessInfo.processInfo.environment["SWIFTCI_USE_LOCAL_DEPS"] == nil {
@@ -237,9 +263,11 @@ if ProcessInfo.processInfo.environment["SWIFTPM_LLBUILD_FWK"] == nil {
 if ProcessInfo.processInfo.environment["SWIFTCI_USE_LOCAL_DEPS"] == nil {
     package.dependencies += [
         .package(url: "https://github.com/apple/swift-tools-support-core.git", .branch("master")),
+        .package(url: "https://github.com/apple/swift-driver.git", .branch("master")),
     ]
 } else {
     package.dependencies += [
         .package(path: "./swift-tools-support-core"),
+        .package(path: "../swift-driver"),
     ]
 }

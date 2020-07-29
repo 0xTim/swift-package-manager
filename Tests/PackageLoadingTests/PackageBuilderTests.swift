@@ -587,6 +587,7 @@ class PackageBuilderTests: XCTestCase {
         let fs = InMemoryFileSystem(emptyFiles:
             "/Sources/Foo/inc/module.modulemap",
             "/Sources/Foo/inc/Foo.h",
+            "/Sources/Foo/Foo_private.h",
             "/Sources/Foo/Foo.c",
             "/Sources/Bar/include/module.modulemap",
             "/Sources/Bar/include/Bar.h",
@@ -608,6 +609,8 @@ class PackageBuilderTests: XCTestCase {
             package.checkPredefinedPaths(target: "/Sources", testTarget: "/Tests")
 
             package.checkModule("Foo") { module in
+                let clangTarget = module.target as? ClangTarget
+                XCTAssertEqual(clangTarget?.headers.map{ $0.pathString }, ["/Sources/Foo/Foo_private.h", "/Sources/Foo/inc/Foo.h"])
                 module.check(c99name: "Foo", type: .library)
                 module.checkSources(root: "/Sources/Foo", paths: "Foo.c")
                 module.check(includeDir: "/Sources/Foo/inc")
@@ -1448,6 +1451,22 @@ class PackageBuilderTests: XCTestCase {
                 behavior: .error,
                 location: "'SystemModulePackage' /")
         }
+        
+        manifest = Manifest.createV4Manifest(
+            name: "bar",
+            products: [
+                ProductDescription(name: "bar", type: .library(.automatic), targets: ["bar"])
+            ],
+            targets: [
+                TargetDescription(name: "bar", type: .system)
+            ]
+        )
+        PackageBuilderTester(manifest, in: fs) { _, diagnostics in
+            diagnostics.check(
+                diagnostic: "package has unsupported layout; missing system target module map at '/Sources/bar/module.modulemap'",
+                behavior: .error
+            )
+        }
     }
 
     func testBadExecutableProductDecl() {
@@ -1525,7 +1544,8 @@ class PackageBuilderTests: XCTestCase {
             "/Sources/foo/module.modulemap",
             "/Sources/bar/bar.swift",
             "/Sources/cbar/bar.c",
-            "/Sources/cbar/include/bar.h"
+            "/Sources/cbar/include/bar.h",
+            "/Tests/test/test.swift"
         )
 
         // One platform with an override.
@@ -1539,13 +1559,14 @@ class PackageBuilderTests: XCTestCase {
                 TargetDescription(name: "foo", type: .system),
                 TargetDescription(name: "cbar"),
                 TargetDescription(name: "bar", dependencies: ["foo"]),
+                TargetDescription(name: "test", type: .test)
             ]
         )
 
         var expectedPlatforms = [
             "linux": "0.0",
             "macos": "10.12",
-            "ios": "8.0",
+            "ios": "9.0",
             "tvos": "9.0",
             "watchos": "2.0",
             "android": "0.0",
@@ -1570,6 +1591,16 @@ class PackageBuilderTests: XCTestCase {
                 t.checkPlatformOptions(.macOS, options: ["option1"])
                 t.checkPlatformOptions(.iOS, options: [])
             }
+            package.checkModule("test") { t in
+                var expected = expectedPlatforms
+                [PackageModel.Platform.macOS, .iOS, .tvOS, .watchOS].forEach {
+                    expected[$0.name] = PackageBuilderTester.xcTestMinimumDeploymentTargets[$0]?.versionString
+                }
+                t.checkPlatforms(expected)
+                t.checkPlatformOptions(.macOS, options: ["option1"])
+                t.checkPlatformOptions(.iOS, options: [])
+            }
+            package.checkProduct("pkgPackageTests") { _ in }
         }
 
         // Two platforms with overrides.
@@ -1591,7 +1622,7 @@ class PackageBuilderTests: XCTestCase {
             "macos": "10.12",
             "tvos": "10.0",
             "linux": "0.0",
-            "ios": "8.0",
+            "ios": "9.0",
             "watchos": "2.0",
             "android": "0.0",
             "wasi": "0.0",
@@ -1655,6 +1686,54 @@ class PackageBuilderTests: XCTestCase {
         PackageBuilderTester(manifest, in: fs) { package, _ in
             package.checkModule("lib") { module in
                 module.checkSources(root: "/Sources/lib", paths: "lib.c", "lib.s", "lib2.S")
+            }
+        }
+    }
+
+    func testUnknownSourceFilesUnderDeclaredSourcesIgnoredInV5_2Manifest() throws {
+        // Files with unknown suffixes under declared sources are not considered valid sources in 5.2 manifest.
+        let fs = InMemoryFileSystem(emptyFiles:
+            "/Sources/lib/movie.mkv",
+            "/Sources/lib/lib.c",
+            "/Sources/lib/include/lib.h"
+        )
+
+        let manifest = Manifest.createManifest(
+            name: "pkg",
+            v: .v5_2,
+            targets: [
+                TargetDescription(name: "lib", dependencies: [], path: "./Sources/lib", sources: ["."]),
+            ]
+        )
+
+        PackageBuilderTester(manifest, in: fs) { package, _ in
+            package.checkModule("lib") { module in
+                module.checkSources(root: "/Sources/lib", paths: "lib.c")
+                module.check(includeDir: "/Sources/lib/include")
+            }
+        }
+    }
+
+    func testUnknownSourceFilesUnderDeclaredSourcesCompiledInV5_3Manifest() throws {
+        // Files with unknown suffixes under declared sources are treated as compilable in 5.3 manifest.
+        let fs = InMemoryFileSystem(emptyFiles:
+            "/Sources/lib/movie.mkv",
+            "/Sources/lib/lib.c",
+            "/Sources/lib/include/lib.h"
+        )
+
+        let manifest = Manifest.createManifest(
+            name: "pkg",
+            v: .v5_3,
+            targets: [
+                TargetDescription(name: "lib", dependencies: [], path: "./Sources/lib", sources: ["."]),
+            ]
+        )
+
+        PackageBuilderTester(manifest, in: fs) { package, _ in
+            package.checkModule("lib") { module in
+                module.checkSources(root: "/Sources/lib", paths: "movie.mkv", "lib.c")
+                module.check(includeDir: "/Sources/lib/include")
             }
         }
     }
@@ -1979,6 +2058,13 @@ final class PackageBuilderTester {
     /// Contains the products which have not been checked yet.
     private var uncheckedProducts: Set<PackageModel.Product> = []
 
+    fileprivate static let xcTestMinimumDeploymentTargets = [
+        PackageModel.Platform.macOS: PlatformVersion("10.15"),
+        PackageModel.Platform.iOS: PlatformVersion("9.0"),
+        PackageModel.Platform.tvOS: PlatformVersion("9.0"),
+        PackageModel.Platform.watchOS: PlatformVersion("2.0"),
+    ]
+
     @discardableResult
     init(
         _ manifest: Manifest,
@@ -1996,8 +2082,10 @@ final class PackageBuilderTester {
             // FIXME: We should allow customizing root package boolean.
             let builder = PackageBuilder(
                 manifest: manifest,
+                productFilter: .everything,
                 path: path,
                 remoteArtifacts: remoteArtifacts,
+                xcTestMinimumDeploymentTargets: Self.xcTestMinimumDeploymentTargets,
                 fileSystem: fs,
                 diagnostics: diagnostics,
                 shouldCreateMultipleTestProducts: shouldCreateMultipleTestProducts,

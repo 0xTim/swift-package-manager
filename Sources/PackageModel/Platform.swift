@@ -34,7 +34,7 @@ public final class PlatformRegistry {
 }
 
 /// Represents a platform.
-public struct Platform: Equatable, Hashable {
+public struct Platform: Equatable, Hashable, Codable {
     /// The name of the platform.
     public let name: String
 
@@ -51,7 +51,7 @@ public struct Platform: Equatable, Hashable {
     }
     
     public static let macOS: Platform = Platform(name: "macos", oldestSupportedVersion: "10.10")
-    public static let iOS: Platform = Platform(name: "ios", oldestSupportedVersion: "8.0")
+    public static let iOS: Platform = Platform(name: "ios", oldestSupportedVersion: "9.0")
     public static let tvOS: Platform = Platform(name: "tvos", oldestSupportedVersion: "9.0")
     public static let watchOS: Platform = Platform(name: "watchos", oldestSupportedVersion: "2.0")
     public static let linux: Platform = Platform(name: "linux", oldestSupportedVersion: .unknown)
@@ -62,7 +62,7 @@ public struct Platform: Equatable, Hashable {
 }
 
 /// Represents a platform version.
-public struct PlatformVersion: ExpressibleByStringLiteral, Comparable, Hashable {
+public struct PlatformVersion: ExpressibleByStringLiteral, Comparable, Hashable, Codable {
 
     /// The unknown platform version.
     public static let unknown: PlatformVersion = .init("0.0.0")
@@ -115,7 +115,7 @@ public struct PlatformVersion: ExpressibleByStringLiteral, Comparable, Hashable 
 }
 
 /// Represents a platform supported by a target.
-public struct SupportedPlatform {
+public struct SupportedPlatform: Codable {
     /// The platform.
     public let platform: Platform
 

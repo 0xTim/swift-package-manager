@@ -46,8 +46,14 @@ public struct BuildParameters: Encodable {
     public var toolchain: Toolchain { _toolchain.toolchain }
     private let _toolchain: _Toolchain
 
+    /// Host triple.
+    public var hostTriple: Triple
+
     /// Destination triple.
     public var triple: Triple
+
+    /// The architectures to build for.
+    public var archs: [String]
 
     /// Extra build flags.
     public var flags: BuildFlags
@@ -85,6 +91,16 @@ public struct BuildParameters: Encodable {
     /// module to finish building.
     public var emitSwiftModuleSeparately: Bool
 
+    /// Whether to use the integrated Swift driver rather than shelling out
+    /// to a separate process.
+    public var useIntegratedSwiftDriver: Bool
+
+    /// Whether to use the explicit module build flow (with the integrated driver)
+    public var useExplicitModuleBuild: Bool
+
+    /// Whether to output a graphviz file visualization of the combined job graph for all targets
+    public var printManifestGraphviz: Bool
+
     /// Whether to create dylibs for dynamic library products.
     public var shouldCreateDylibForDynamicProducts: Bool
 
@@ -116,7 +132,9 @@ public struct BuildParameters: Encodable {
         dataPath: AbsolutePath,
         configuration: BuildConfiguration,
         toolchain: Toolchain,
+        hostTriple: Triple? = nil,
         destinationTriple: Triple? = nil,
+        archs: [String] = [],
         flags: BuildFlags,
         xcbuildFlags: [String] = [],
         toolsVersion: ToolsVersion = ToolsVersion.currentToolsVersion,
@@ -130,12 +148,17 @@ public struct BuildParameters: Encodable {
         enableParseableModuleInterfaces: Bool = false,
         enableTestDiscovery: Bool = false,
         emitSwiftModuleSeparately: Bool = false,
-        isXcodeBuildSystemEnabled: Bool = false
+        useIntegratedSwiftDriver: Bool = false,
+        useExplicitModuleBuild: Bool = false,
+        isXcodeBuildSystemEnabled: Bool = false,
+        printManifestGraphviz: Bool = false
     ) {
         self.dataPath = dataPath
         self.configuration = configuration
         self._toolchain = _Toolchain(toolchain: toolchain)
+        self.hostTriple = hostTriple ?? .getHostTriple(usingSwiftCompiler: toolchain.swiftCompiler)
         self.triple = destinationTriple ?? .getHostTriple(usingSwiftCompiler: toolchain.swiftCompiler)
+        self.archs = archs
         self.flags = flags
         self.xcbuildFlags = xcbuildFlags
         self.toolsVersion = toolsVersion
@@ -149,7 +172,10 @@ public struct BuildParameters: Encodable {
         self.enableParseableModuleInterfaces = enableParseableModuleInterfaces
         self.enableTestDiscovery = enableTestDiscovery
         self.emitSwiftModuleSeparately = emitSwiftModuleSeparately
+        self.useIntegratedSwiftDriver = useIntegratedSwiftDriver
+        self.useExplicitModuleBuild = useExplicitModuleBuild
         self.isXcodeBuildSystemEnabled = isXcodeBuildSystemEnabled
+        self.printManifestGraphviz = printManifestGraphviz
     }
 
     /// The path to the build directory (inside the data directory).
@@ -250,5 +276,19 @@ private struct _Toolchain: Encodable {
         try container.encode(toolchain.extraCPPFlags, forKey: .extraCPPFlags)
         try container.encode(toolchain.extraSwiftCFlags, forKey: .extraSwiftCFlags)
         try container.encode(toolchain.swiftCompiler, forKey: .swiftCompiler)
+    }
+}
+
+extension BuildParameters {
+    /// Whether to build Swift code with whole module optimization (WMO)
+    /// enabled.
+    public var useWholeModuleOptimization: Bool {
+        switch configuration {
+        case .debug:
+            return false
+
+        case .release:
+            return true
+        }
     }
 }

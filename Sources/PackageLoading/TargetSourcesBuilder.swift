@@ -103,7 +103,7 @@ public struct TargetSourcesBuilder {
     }
 
     /// Run the builder to produce the sources of the target.
-    public func run() throws -> (sources: Sources, resources: [Resource]) {
+    public func run() throws -> (sources: Sources, resources: [Resource], headers: [AbsolutePath]) {
         let contents = computeContents()
         var pathToRule: [AbsolutePath: Rule] = [:]
 
@@ -117,14 +117,15 @@ public struct TargetSourcesBuilder {
         if toolsVersion >= .v5_3 {
             let filesWithNoRules = pathToRule.filter { $0.value.rule == .none }
             if !filesWithNoRules.isEmpty {
-                var error = "found \(filesWithNoRules.count) file(s) which are unhandled; explicitly declare them as resources or exclude from the target\n"
+                var warning = "found \(filesWithNoRules.count) file(s) which are unhandled; explicitly declare them as resources or exclude from the target\n"
                 for (file, _) in filesWithNoRules {
-                    error += "    " + file.pathString + "\n"
+                    warning += "    " + file.pathString + "\n"
                 }
-                diags.emit(.error(error))
+                diags.emit(.warning(warning))
             }
         }
 
+        let headers = pathToRule.lazy.filter { $0.value.rule == .header }.map { $0.key }.sorted()
         let compilePaths = pathToRule.lazy.filter { $0.value.rule == .compile }.map { $0.key }
         let sources = Sources(paths: Array(compilePaths), root: targetPath)
         let resources: [Resource] = pathToRule.compactMap { resource(for: $0.key, with: $0.value) }
@@ -140,7 +141,7 @@ public struct TargetSourcesBuilder {
             throw Target.Error.mixedSources(targetPath)
         }
 
-        return (sources, resources)
+        return (sources, resources, headers)
     }
 
     private struct Rule {
@@ -175,7 +176,10 @@ public struct TargetSourcesBuilder {
                     if let ext = path.extension,
                       FileRuleDescription.header.fileTypes.contains(ext) {
                         matchedRule = Rule(rule: .header, localization: nil)
-                    } else {
+                    } else if toolsVersion >= .v5_3 {
+                        matchedRule = Rule(rule: .compile, localization: nil)
+                    } else if let ext = path.extension,
+                      SupportedLanguageExtension.validExtensions(toolsVersion: toolsVersion).contains(ext) {
                         matchedRule = Rule(rule: .compile, localization: nil)
                     }
                     // The source file might have been declared twice so
@@ -200,6 +204,8 @@ public struct TargetSourcesBuilder {
 
             if let needle = effectiveRules.first(where: { $0.match(path: path, toolsVersion: toolsVersion) }) {
                 matchedRule = Rule(rule: needle.rule, localization: nil)
+            } else if path.parentDirectory.extension == Resource.localizationDirectoryExtension {
+                matchedRule = Rule(rule: .processResource, localization: nil)
             }
         }
 
@@ -511,7 +517,7 @@ public struct FileRuleDescription {
         .init(
             rule: .header,
             toolsVersion: .minimumRequired,
-            fileTypes: ["h"]
+            fileTypes: ["h", "hh", "hpp", "h++", "hp", "hxx", "H", "ipp", "def"]
         )
     }()
 

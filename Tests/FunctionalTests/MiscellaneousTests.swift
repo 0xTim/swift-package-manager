@@ -107,7 +107,7 @@ class MiscellaneousTestCase: XCTestCase {
         }
     }
 
-    func testPackageManagerDefineAndXArgs() {
+    func DISABLED_testPackageManagerDefineAndXArgs() {
         fixture(name: "Miscellaneous/-DSWIFT_PACKAGE") { prefix in
             XCTAssertBuildFails(prefix)
             XCTAssertBuilds(prefix, Xcc: ["-DEXTRA_C_DEFINE=2"], Xswiftc: ["-DEXTRA_SWIFTC_DEFINE"])
@@ -259,8 +259,17 @@ class MiscellaneousTestCase: XCTestCase {
     func testSwiftTestFilter() throws {
         #if os(macOS)
             fixture(name: "Miscellaneous/ParallelTestsPkg") { prefix in
-                let (_, stderr) = try SwiftPMProduct.SwiftTest.execute(["--filter", ".*1"], packagePath: prefix)
-                XCTAssertMatch(stderr, .contains("testExample1"))
+                let (stdout, _) = try SwiftPMProduct.SwiftTest.execute(["--filter", ".*1", "-l"], packagePath: prefix)
+                XCTAssertMatch(stdout, .contains("testExample1"))
+                XCTAssertNoMatch(stdout, .contains("testExample2"))
+                XCTAssertNoMatch(stdout, .contains("testSureFailure"))
+            }
+
+            fixture(name: "Miscellaneous/ParallelTestsPkg") { prefix in
+                let (stdout, _) = try SwiftPMProduct.SwiftTest.execute(["--filter", ".*1", "--filter", "testSureFailure", "-l"], packagePath: prefix)
+                XCTAssertMatch(stdout, .contains("testExample1"))
+                XCTAssertNoMatch(stdout, .contains("testExample2"))
+                XCTAssertMatch(stdout, .contains("testSureFailure"))
             }
         #endif
     }

@@ -14,7 +14,7 @@ import PackageModel
 /// Create an initial template package.
 public final class InitPackage {
     /// The tool version to be used for new packages.
-    public static let newPackageToolsVersion = ToolsVersion(version: "5.2.0")
+    public static let newPackageToolsVersion = ToolsVersion(version: "5.3.0")
 
     /// Options for the template package.
     public struct InitPackageOptions {
@@ -153,8 +153,8 @@ public final class InitPackage {
 
                 var param = ".\(platform.manifestName)("
                 if supportedPlatform.isManifestAPIAvailable {
-                    if platform == .macOS {
-                        param += ".v10_\(version.minor)"
+                    if version.minor > 0 {
+                        param += ".v\(version.major)_\(version.minor)"
                     } else {
                         param += ".v\(version.major)"
                     }
@@ -174,7 +174,7 @@ public final class InitPackage {
             if packageType == .library || packageType == .manifest {
                 pkgParams.append("""
                     products: [
-                        // Products define the executables and libraries produced by a package, and make them visible to other packages.
+                        // Products define the executables and libraries a package produces, and make them visible to other packages.
                         .library(
                             name: "\(pkgname)",
                             targets: ["\(pkgname)"]),
@@ -193,7 +193,7 @@ public final class InitPackage {
                 pkgParams.append("""
                     targets: [
                         // Targets are the basic building blocks of a package. A target can define a module or a test suite.
-                        // Targets can depend on other targets in this package, and on products in packages which this package depends on.
+                        // Targets can depend on other targets in this package, and on products in packages this package depends on.
                         .target(
                             name: "\(pkgname)",
                             dependencies: []),
@@ -400,6 +400,9 @@ public final class InitPackage {
                             return
                         }
 
+                        // Mac Catalyst won't have `Process`, but it is supported for executables.
+                        #if !targetEnvironment(macCatalyst)
+
                         let fooBinary = productsDirectory.appendingPathComponent("\(pkgname)")
 
                         let process = Process()
@@ -415,6 +418,7 @@ public final class InitPackage {
                         let output = String(data: data, encoding: .utf8)
 
                         XCTAssertEqual(output, "Hello, world!\\n")
+                        #endif
                     }
 
                     /// Returns path to the built products directory.
@@ -518,11 +522,11 @@ extension PackageModel.Platform {
 
 extension SupportedPlatform {
     var isManifestAPIAvailable: Bool {
-        if platform == .macOS {
-            guard self.version.major == 10, self.version.patch == 0 else {
+        if platform == .macOS && self.version.major == 10 {
+            guard self.version.patch == 0 else {
                 return false
             }
-        } else if [Platform.iOS, .watchOS, .tvOS].contains(platform) {
+        } else if [Platform.macOS, .iOS, .watchOS, .tvOS].contains(platform) {
             guard self.version.minor == 0, self.version.patch == 0 else {
                 return false
             }
@@ -531,14 +535,16 @@ extension SupportedPlatform {
         }
 
         switch platform {
-        case .macOS:
+        case .macOS where version.major == 10:
             return (10...15).contains(version.minor)
+        case .macOS:
+            return (11...11).contains(version.major)
         case .iOS:
-            return (8...13).contains(version.major)
+            return (8...14).contains(version.major)
         case .tvOS:
-            return (9...13).contains(version.major)
+            return (9...14).contains(version.major)
         case .watchOS:
-            return (2...6).contains(version.major)
+            return (2...7).contains(version.major)
 
         default:
             return false

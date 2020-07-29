@@ -14,7 +14,7 @@ import TSCBasic
 import TSCUtility
 import SPMTestSupport
 import PackageModel
-import PackageLoading
+@testable import PackageLoading
 import SPMBuildCore
 import Build
 
@@ -66,6 +66,7 @@ final class BuildPlanTests: XCTestCase {
             dataPath: buildPath,
             configuration: config,
             toolchain: MockToolchain(),
+            hostTriple: hostTriple,
             destinationTriple: destinationTriple,
             flags: flags,
             jobs: 3,
@@ -232,8 +233,6 @@ final class BuildPlanTests: XCTestCase {
                 try llbuild.generateManifest(at: yaml)
                 let contents = try localFileSystem.readFileContents(yaml).description
                 XCTAssertMatch(contents, .contains("""
-                      "C.exe-release.module":
-                        tool: swift-compiler
                         inputs: ["/Pkg/Sources/exe/main.swift","/path/to/build/release/PkgLib.swiftmodule"]
                     """))
             }
@@ -260,8 +259,6 @@ final class BuildPlanTests: XCTestCase {
                 try llbuild.generateManifest(at: yaml)
                 let contents = try localFileSystem.readFileContents(yaml).description
                 XCTAssertMatch(contents, .contains("""
-                      "C.exe-debug.module":
-                        tool: swift-compiler
                         inputs: ["/Pkg/Sources/exe/main.swift"]
                     """))
             }
@@ -836,6 +833,7 @@ final class BuildPlanTests: XCTestCase {
         XCTAssertMatch(fooTests, ["-swift-version", "4", "-enable-batch-mode", "-Onone", "-enable-testing", "-g", .equal(j), "-DSWIFT_PACKAGE", "-DDEBUG", "-module-cache-path", "/path/to/build/debug/ModuleCache", .anySequence])
 
       #if os(macOS)
+        let version = MinimumDeploymentTarget.computeXCTestMinimumDeploymentTarget(for: .macOS).versionString
         XCTAssertEqual(try result.buildProduct(for: "PkgPackageTests").linkArguments(), [
             "/fake/path/to/swiftc", "-L", "/path/to/build/debug", "-o",
             "/path/to/build/debug/PkgPackageTests.xctest/Contents/MacOS/PkgPackageTests", "-module-name",
@@ -843,7 +841,7 @@ final class BuildPlanTests: XCTestCase {
             "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../../",
             "@/path/to/build/debug/PkgPackageTests.product/Objects.LinkFileList",
             "-Xlinker", "-rpath", "-Xlinker", "/fake/path/lib/swift/macosx",
-            "-target", "x86_64-apple-macosx10.10",
+            "-target", "x86_64-apple-macosx\(version)",
             "-Xlinker", "-add_ast_path", "-Xlinker", "/path/to/build/debug/Foo.swiftmodule",
             "-Xlinker", "-add_ast_path", "-Xlinker", "/path/to/build/debug/FooTests.swiftmodule",
         ])
@@ -1220,12 +1218,19 @@ final class BuildPlanTests: XCTestCase {
                     ]),
             ]
         )
-        XCTAssertNoDiagnostics(diagnostics)
+
+        XCTAssertEqual(diagnostics.diagnostics.count, 1)
+        let firstDiagnostic = diagnostics.diagnostics.first.map({ $0.message.text })
+        XCTAssert(
+            firstDiagnostic == "dependency 'C' is not used by any target",
+            "Unexpected diagnostic: " + (firstDiagnostic ?? "[none]")
+        )
+
         let graphResult = PackageGraphResult(graph)
         graphResult.check(reachableProducts: "aexec", "BLibrary")
         graphResult.check(reachableTargets: "ATarget", "BTarget1")
-        graphResult.check(products: "aexec", "BLibrary", "bexec", "cexec")
-        graphResult.check(targets: "ATarget", "BTarget1", "BTarget2", "CTarget")
+        graphResult.check(products: "aexec", "BLibrary")
+        graphResult.check(targets: "ATarget", "BTarget1")
 
         let planResult = BuildPlanResult(plan: try BuildPlan(
             buildParameters: mockBuildParameters(),
@@ -1234,8 +1239,8 @@ final class BuildPlanTests: XCTestCase {
             fileSystem: fileSystem
         ))
 
-        planResult.checkProductsCount(4)
-        planResult.checkTargetsCount(4)
+        planResult.checkProductsCount(2)
+        planResult.checkTargetsCount(2)
     }
 
     func testReachableBuildProductsAndTargets() throws {
@@ -1455,7 +1460,7 @@ final class BuildPlanTests: XCTestCase {
 
         let diagnostic = diagnostics.diagnostics.last!
 
-        XCTAssertEqual(diagnostic.message.text, "couldn't find pc file")
+        XCTAssertEqual(diagnostic.message.text, "couldn't find pc file for BTarget")
         XCTAssertEqual(diagnostic.message.behavior, .warning)
         XCTAssertEqual(diagnostic.location.description, "'BTarget' BTarget.pc")
     }
@@ -1881,7 +1886,8 @@ final class BuildPlanTests: XCTestCase {
                     targets: [
                         TargetDescription(name: "PkgB", dependencies: ["swiftlib"]),
                     ]),
-            ]
+            ],
+            explicitProduct: "exe"
         )
         XCTAssertNoDiagnostics(diagnostics)
 
@@ -1894,7 +1900,7 @@ final class BuildPlanTests: XCTestCase {
             let contents = try localFileSystem.readFileContents(yaml).description
             XCTAssertTrue(contents.contains("""
                     inputs: ["/PkgA/Sources/swiftlib/lib.swift","/path/to/build/debug/exe"]
-                    outputs: ["/path/to/build/debug/swiftlib.build/lib.swift.o","/path/to/build/debug/swiftlib.swiftmodule"]
+                    outputs: ["/path/to/build/debug/swiftlib.build/lib.swift.o","/path/to/build/debug/
                 """), contents)
         }
     }
@@ -2135,7 +2141,8 @@ final class BuildPlanTests: XCTestCase {
                     outputs: ["/path/to/build/debug/exe.build/exe.swiftmodule.o"]
                     description: "Wrapping AST for exe for debugging"
                     args: ["/fake/path/to/swiftc","-modulewrap","/path/to/build/debug/exe.swiftmodule","-o","/path/to/build/debug/exe.build/exe.swiftmodule.o","-target","x86_64-unknown-linux-gnu"]
-
+                """))
+            XCTAssertMatch(contents, .contains("""
                   "/path/to/build/debug/lib.build/lib.swiftmodule.o":
                     tool: shell
                     inputs: ["/path/to/build/debug/lib.swiftmodule"]
@@ -2209,7 +2216,7 @@ final class BuildPlanTests: XCTestCase {
         ])
     }
 
-    func testBinaryTargets() throws {
+    func testBinaryTargets(platform: String, arch: String, destinationTriple: Triple) throws {
         let fs = InMemoryFileSystem(emptyFiles:
             "/Pkg/Sources/exe/main.swift",
             "/Pkg/Sources/Library/Library.swift",
@@ -2229,15 +2236,15 @@ final class BuildPlanTests: XCTestCase {
                     <array>
                         <dict>
                             <key>LibraryIdentifier</key>
-                            <string>macos-x86_64</string>
+                            <string>\(platform)-\(arch)</string>
                             <key>LibraryPath</key>
                             <string>Framework.framework</string>
                             <key>SupportedArchitectures</key>
                             <array>
-                                <string>x86_64</string>
+                                <string>\(arch)</string>
                             </array>
                             <key>SupportedPlatform</key>
-                            <string>macos</string>
+                            <string>\(platform)</string>
                         </dict>
                     </array>
                     <key>CFBundlePackageType</key>
@@ -2260,17 +2267,17 @@ final class BuildPlanTests: XCTestCase {
                     <array>
                         <dict>
                             <key>LibraryIdentifier</key>
-                            <string>macos-x86_64</string>
+                            <string>\(platform)-\(arch)</string>
                             <key>HeadersPath</key>
                             <string>Headers</string>
                             <key>LibraryPath</key>
                             <string>libStaticLibrary.a</string>
                             <key>SupportedArchitectures</key>
                             <array>
-                                <string>x86_64</string>
+                                <string>\(arch)</string>
                             </array>
                             <key>SupportedPlatform</key>
-                            <string>macos</string>
+                            <string>\(platform)</string>
                         </dict>
                     </array>
                     <key>CFBundlePackageType</key>
@@ -2309,7 +2316,7 @@ final class BuildPlanTests: XCTestCase {
         XCTAssertNoDiagnostics(diagnostics)
 
         let result = BuildPlanResult(plan: try BuildPlan(
-            buildParameters: mockBuildParameters(destinationTriple: .macOS),
+            buildParameters: mockBuildParameters(destinationTriple: destinationTriple),
             graph: graph,
             diagnostics: diagnostics,
             fileSystem: fs
@@ -2337,7 +2344,7 @@ final class BuildPlanTests: XCTestCase {
 
         let clibraryBasicArguments = try result.target(for: "CLibrary").clangTarget().basicArguments()
         XCTAssertMatch(clibraryBasicArguments, [.anySequence, "-F", "/path/to/build/debug", .anySequence])
-        XCTAssertMatch(clibraryBasicArguments, [.anySequence, "-I", "/Pkg/StaticLibrary.xcframework/macos-x86_64/Headers", .anySequence])
+        XCTAssertMatch(clibraryBasicArguments, [.anySequence, "-I", "/Pkg/StaticLibrary.xcframework/\(platform)-\(arch)/Headers", .anySequence])
 
         let clibraryLinkArguments = try result.buildProduct(for: "CLibrary").linkArguments()
         XCTAssertMatch(clibraryLinkArguments, [.anySequence, "-F", "/path/to/build/debug", .anySequence])
@@ -2349,6 +2356,81 @@ final class BuildPlanTests: XCTestCase {
         
         let dynamicLibraryPathExtension = try result.buildProduct(for: "Library").binary.extension
         XCTAssertMatch(dynamicLibraryPathExtension, "dylib")
+    }
+
+    func testBinaryTargets() throws {
+        try testBinaryTargets(platform: "macos", arch: "x86_64", destinationTriple: .macOS)
+        let arm64Triple = try Triple("arm64-apple-macosx")
+        try testBinaryTargets(platform: "macos", arch: "arm64", destinationTriple: arm64Triple)
+        let arm64eTriple = try Triple("arm64e-apple-macosx")
+        try testBinaryTargets(platform: "macos", arch: "arm64e", destinationTriple: arm64eTriple)
+    }
+
+    func testAddressSanitizer() throws {
+        try sanitizerTest(.address, expectedName: "address")
+    }
+
+    func testThreadSanitizer() throws {
+        try sanitizerTest(.thread, expectedName: "thread")
+    }
+
+    func testUndefinedSanitizer() throws {
+        try sanitizerTest(.undefined, expectedName: "undefined")
+    }
+
+    func testScudoSanitizer() throws {
+        try sanitizerTest(.scudo, expectedName: "scudo")
+    }
+
+    private func sanitizerTest(_ sanitizer: Sanitizer, expectedName: String) throws {
+        let fs = InMemoryFileSystem(emptyFiles:
+            "/Pkg/Sources/exe/main.swift",
+            "/Pkg/Sources/lib/lib.swift",
+            "/Pkg/Sources/clib/clib.c",
+            "/Pkg/Sources/clib/include/clib.h"
+        )
+
+        let diagnostics = DiagnosticsEngine()
+        let graph = loadPackageGraph(fs: fs, diagnostics: diagnostics,
+            manifests: [
+                Manifest.createV4Manifest(
+                    name: "Pkg",
+                    path: "/Pkg",
+                    url: "/Pkg",
+                    packageKind: .root,
+                    targets: [
+                        TargetDescription(name: "exe", dependencies: ["lib", "clib"]),
+                        TargetDescription(name: "lib", dependencies: []),
+                        TargetDescription(name: "clib", dependencies: []),
+                    ]),
+            ]
+        )
+        XCTAssertNoDiagnostics(diagnostics)
+
+        // Unrealistic: we can't enable all of these at once on all platforms.
+        // This test codifies current behaviour, not ideal behaviour, and
+        // may need to be amended if we change it.
+        var parameters = mockBuildParameters(shouldLinkStaticSwiftStdlib: true)
+        parameters.sanitizers = EnabledSanitizers([sanitizer])
+
+        let result = BuildPlanResult(plan: try BuildPlan(
+            buildParameters: parameters,
+            graph: graph, diagnostics: diagnostics, fileSystem: fs)
+        )
+
+        result.checkProductsCount(1)
+        result.checkTargetsCount(3)
+
+        let exe = try result.target(for: "exe").swiftTarget().compileArguments()
+        XCTAssertTrue(exe.contains("-sanitize=\(expectedName)"))
+
+        let lib = try result.target(for: "lib").swiftTarget().compileArguments()
+        XCTAssertTrue(lib.contains("-sanitize=\(expectedName)"))
+
+        let clib  = try result.target(for: "clib").clangTarget().basicArguments()
+        XCTAssertTrue(clib.contains("-fsanitize=\(expectedName)"))
+
+        XCTAssertTrue(try result.buildProduct(for: "exe").linkArguments().contains("-sanitize=\(expectedName)"))
     }
 }
 

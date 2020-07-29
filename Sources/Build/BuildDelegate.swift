@@ -96,12 +96,16 @@ final class TestDiscoveryCommand: CustomLLBuildCommand {
             return path.basename == "main.swift"
         }
 
+        var mainFile: AbsolutePath?
         // Write one file for each test module.
         //
         // We could write everything in one file but that can easily run into type conflicts due
         // in complex packages with large number of test targets.
         for file in outputs {
-            if isMainFile(file) { continue }
+            if mainFile == nil && isMainFile(file) {
+                mainFile = file
+                continue 
+            }
 
             // FIXME: This is relying on implementation detail of the output but passing the
             // the context all the way through is not worth it right now.
@@ -116,8 +120,7 @@ final class TestDiscoveryCommand: CustomLLBuildCommand {
         }
 
         // Write the main file.
-        let mainFile = outputs.first(where: isMainFile)!
-        let stream = try LocalFileOutputByteStream(mainFile)
+        let stream = try LocalFileOutputByteStream(mainFile!)
 
         stream <<< "import XCTest" <<< "\n\n"
         stream <<< "var tests = [XCTestCaseEntry]()" <<< "\n"
@@ -174,8 +177,11 @@ public struct BuildDescription: Codable {
     public typealias CommandName = String
     public typealias TargetName = String
 
-    /// The map of command to target names for Swift targets.
-    let swiftTargetMap: [CommandName: TargetName]
+    /// The Swift compiler invocation targets.
+    let swiftCommands: [BuildManifest.CmdName : SwiftCompilerTool]
+
+    /// The Swift compiler frontend invocation targets.
+    let swiftFrontendCommands: [BuildManifest.CmdName : SwiftFrontendTool]
 
     /// The map of test discovery commands.
     let testDiscoveryCommands: [BuildManifest.CmdName: LLBuildManifest.TestDiscoveryTool]
@@ -188,16 +194,13 @@ public struct BuildDescription: Codable {
 
     public init(
         plan: BuildPlan,
+        swiftCommands: [BuildManifest.CmdName : SwiftCompilerTool],
+        swiftFrontendCommands: [BuildManifest.CmdName : SwiftFrontendTool],
         testDiscoveryCommands: [BuildManifest.CmdName: LLBuildManifest.TestDiscoveryTool],
         copyCommands: [BuildManifest.CmdName: LLBuildManifest.CopyTool]
     ) {
-        let buildConfig = plan.buildParameters.configuration.dirname
-
-        swiftTargetMap = Dictionary(uniqueKeysWithValues: plan.targetMap.values.compactMap{
-            guard case .swift(let desc) = $0 else { return nil }
-            return (desc.target.getCommandName(config: buildConfig), desc.target.name)
-        })
-
+        self.swiftCommands = swiftCommands
+        self.swiftFrontendCommands = swiftFrontendCommands
         self.testDiscoveryCommands = testDiscoveryCommands
         self.copyCommands = copyCommands
 
@@ -262,7 +265,7 @@ public final class BuildExecutionContext {
     private var indexStoreAPICache = LazyCache(createIndexStoreAPI)
     private func createIndexStoreAPI() -> Result<IndexStoreAPI, Error> {
         Result {
-            let ext = buildParameters.triple.dynamicLibraryExtension
+            let ext = buildParameters.hostTriple.dynamicLibraryExtension
             let indexStoreLib = buildParameters.toolchain.toolchainLibDir.appending(component: "libIndexStore" + ext)
             return try IndexStoreAPI(dylib: indexStoreLib)
         }
@@ -351,9 +354,15 @@ public final class BuildDelegate: BuildSystemDelegate, SwiftCompilerOutputParser
         self.outputStream = outputStream as? ThreadSafeOutputByteStream ?? ThreadSafeOutputByteStream(outputStream)
         self.progressAnimation = progressAnimation
         self.buildExecutionContext = bctx
-        self.swiftParsers = bctx.buildDescription?.swiftTargetMap.mapValues {
-            SwiftCompilerOutputParser(targetName: $0, delegate: self)
+
+        let swiftParsers = bctx.buildDescription?.swiftCommands.mapValues { tool in
+            SwiftCompilerOutputParser(targetName: tool.moduleName, delegate: self)
         } ?? [:]
+        let swiftFrontendParsers = bctx.buildDescription?.swiftFrontendCommands.mapValues { tool in
+            SwiftCompilerOutputParser(targetName: tool.moduleName, delegate: self)
+        } ?? [:]
+        self.swiftParsers = swiftParsers.merging(swiftFrontendParsers) { (_, _) in fatalError("duplicated Swift command")
+        }
     }
 
     public var fs: SPMLLBuild.FileSystem? {

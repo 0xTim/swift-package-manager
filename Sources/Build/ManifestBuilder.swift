@@ -17,6 +17,8 @@ import PackageModel
 import PackageGraph
 import SPMBuildCore
 
+@_implementationOnly import SwiftDriver
+
 public class LLBuildManifestBuilder {
     public enum TargetKind {
         case main
@@ -68,6 +70,13 @@ public class LLBuildManifestBuilder {
         // Create command for all products in the plan.
         for (_, description) in plan.productMap {
             createProductCommand(description)
+        }
+
+        // Output a dot graph
+        if buildParameters.printManifestGraphviz {
+            var serializer = DOTManifestSerializer(manifest: manifest)
+            serializer.writeDOT(to: &stdoutStream)
+            stdoutStream.flush()
         }
 
         try ManifestWriter().write(manifest, at: path)
@@ -177,7 +186,9 @@ extension LLBuildManifestBuilder {
         let moduleNode = Node.file(target.moduleOutputPath)
         let cmdOutputs = objectNodes + [moduleNode]
 
-        if buildParameters.emitSwiftModuleSeparately {
+        if buildParameters.useIntegratedSwiftDriver {
+            addSwiftCmdsViaIntegratedDriver(target, inputs: inputs, objectNodes: objectNodes, moduleNode: moduleNode)
+        } else if buildParameters.emitSwiftModuleSeparately {
             addSwiftCmdsEmitSwiftModuleSeparately(target, inputs: inputs, objectNodes: objectNodes, moduleNode: moduleNode)
         } else {
             addCmdWithBuiltinSwiftTool(target, inputs: inputs, cmdOutputs: cmdOutputs)
@@ -185,6 +196,82 @@ extension LLBuildManifestBuilder {
 
         addTargetCmd(target, cmdOutputs: cmdOutputs)
         addModuleWrapCmd(target)
+    }
+
+    private func addSwiftCmdsViaIntegratedDriver(
+        _ target: SwiftTargetBuildDescription,
+        inputs: [Node],
+        objectNodes: [Node],
+        moduleNode: Node
+    ) {
+        do {
+            // Use the integrated Swift driver to compute the set of frontend
+            // jobs needed to build this Swift target.
+            var commandLine = target.emitCommandLine();
+            commandLine.append("-driver-use-frontend-path")
+            commandLine.append(buildParameters.toolchain.swiftCompiler.pathString)
+            if buildParameters.useExplicitModuleBuild {
+              commandLine.append("-experimental-explicit-module-build")
+            }
+            // FIXME: At some point SwiftPM should provide its own executor for
+            // running jobs/launching processes during planning
+            let executor = try SwiftDriverExecutor(diagnosticsEngine: plan.diagnostics,
+                                                   processSet: ProcessSet(),
+                                                   fileSystem: target.fs,
+                                                   env: ProcessEnv.vars)
+            var driver = try Driver(args: commandLine,
+                                    diagnosticsEngine: plan.diagnostics,
+                                    fileSystem: target.fs,
+                                    executor: executor)
+            let jobs = try driver.planBuild()
+            let resolver = try ArgsResolver(fileSystem: target.fs)
+
+            for job in jobs {
+                let tool = try resolver.resolve(.path(job.tool))
+                let commandLine = try job.commandLine.map{ try resolver.resolve($0) }
+                let arguments = [tool] + commandLine
+
+                let jobInputs = job.inputs.map { $0.resolveToNode() }
+                let jobOutputs = job.outputs.map { $0.resolveToNode() }
+
+                // Add target dependencies as inputs to the main module build command.
+                //
+                // Jobs for a target's intermediate build artifacts, such as PCMs or
+                // modules built from a .swiftinterface, do not have a
+                // dependency on cross-target build products. If multiple targets share
+                // common intermediate dependency modules, such dependencies can lead
+                // to cycles in the resulting manifest.
+                var manifestNodeInputs : [Node] = []
+                if buildParameters.useExplicitModuleBuild && !driver.isExplicitMainModuleJob(job: job) {
+                  manifestNodeInputs = jobInputs
+                } else {
+                  manifestNodeInputs = (inputs + jobInputs).uniqued()
+                }
+
+                let moduleName = target.target.c99name
+                let description = job.description
+                if job.kind.isSwiftFrontend {
+                    manifest.addSwiftFrontendCmd(
+                        name: jobOutputs.first!.name,
+                        moduleName: moduleName,
+                        description: description,
+                        inputs: manifestNodeInputs,
+                        outputs: jobOutputs,
+                        args: arguments
+                    )
+                } else {
+                    manifest.addShellCmd(
+                        name: jobOutputs.first!.name,
+                        description: description,
+                        inputs: manifestNodeInputs,
+                        outputs: jobOutputs,
+                        args: arguments
+                    )
+                }
+             }
+         } catch {
+             fatalError("\(error)")
+         }
     }
 
     private func addSwiftCmdsEmitSwiftModuleSeparately(
@@ -441,7 +528,8 @@ extension LLBuildManifestBuilder {
                 description: "Compiling \(target.target.name) \(path.filename)",
                 inputs: inputs + [.file(path.source)],
                 outputs: [objectFileNode],
-                args: args
+                args: args,
+                deps: path.deps.pathString
             )
         }
 
@@ -589,5 +677,33 @@ extension LLBuildManifestBuilder {
 
     fileprivate func destinationPath(forBinaryAt path: AbsolutePath) -> AbsolutePath {
         plan.buildParameters.buildPath.appending(component: path.basename)
+    }
+}
+
+extension TypedVirtualPath {
+    /// Resolve a typed virtual path provided by the Swift driver to
+    /// a node in the build graph.
+    func resolveToNode() -> Node {
+        switch file {
+        case .relative(let path):
+            return Node.file(localFileSystem.currentWorkingDirectory!.appending(path))
+
+        case .absolute(let path):
+            return Node.file(path)
+
+        case .temporary(let path):
+            return Node.virtual(path.pathString)
+
+        case .standardInput, .standardOutput:
+            fatalError("Cannot handle standard input or output")
+        }
+    }
+}
+
+extension Sequence where Element: Hashable {
+    /// Unique the elements in a sequence.
+    func uniqued() -> [Element] {
+        var seen: Set<Element> = []
+        return filter { seen.insert($0).inserted }
     }
 }

@@ -232,6 +232,9 @@ public final class ClangTargetBuildDescription {
 
     /// The filesystem to operate on.
     let fileSystem: FileSystem
+    
+    /// Where to emit any warnings and errors.
+    let diagnostics: DiagnosticsEngine
 
     /// If this target is a test target.
     public var isTestTarget: Bool {
@@ -239,15 +242,16 @@ public final class ClangTargetBuildDescription {
     }
 
     /// Create a new target description with target and build parameters.
-    init(target: ResolvedTarget, buildParameters: BuildParameters, fileSystem: FileSystem = localFileSystem) throws {
+    init(target: ResolvedTarget, buildParameters: BuildParameters, fileSystem: FileSystem = localFileSystem, diagnostics: DiagnosticsEngine) throws {
         assert(target.underlyingTarget is ClangTarget, "underlying target type mismatch \(target)")
         self.fileSystem = fileSystem
+        self.diagnostics = diagnostics
         self.target = target
         self.buildParameters = buildParameters
         self.tempsPath = buildParameters.buildPath.appending(component: target.c99name + ".build")
         self.derivedSources = Sources(paths: [], root: tempsPath.appending(component: "DerivedSources"))
 
-        // Try computing modulemap path for a C library.
+        // Try computing modulemap path for a C library.  This also creates the file in the file system, if needed.
         if target.type == .library {
             self.moduleMap = try computeModulemapPath()
         }
@@ -405,7 +409,7 @@ public final class ClangTargetBuildDescription {
             return clangTarget.moduleMapPath
         } else {
             // Otherwise try to generate one.
-            var moduleMapGenerator = ModuleMapGenerator(for: clangTarget, fileSystem: fileSystem)
+            var moduleMapGenerator = ModuleMapGenerator(for: clangTarget, fileSystem: fileSystem, diagnostics: diagnostics)
             // FIXME: We should probably only warn if we're unable to generate the modulemap
             // because the clang target is still a valid, it just can't be imported from Swift targets.
             try moduleMapGenerator.generateModuleMap(inDir: tempsPath)
@@ -587,7 +591,11 @@ public final class SwiftTargetBuildDescription {
 
         extension Foundation.Bundle {
             static var module: Bundle = {
-                return Bundle(path: Bundle.main.bundlePath + "/" + "\(bundleBasename)")!
+                let bundlePath = Bundle.main.bundlePath + "/" + "\(bundleBasename)"
+                guard let bundle = Bundle(path: bundlePath) else {
+                    fatalError("could not load resource bundle: \\(bundlePath)")
+                }
+                return bundle
             }()
         }
         """
@@ -648,11 +656,7 @@ public final class SwiftTargetBuildDescription {
 
         // Add arguments to colorize output if stdout is tty
         if BuildParameters.isTTY {
-            if ProcessEnv.vars["SWIFTPM_USE_NEW_COLOR_DIAGNOSTICS"] != nil {
-                args += ["-color-diagnostics"]
-            } else {
-                args += ["-Xfrontend", "-color-diagnostics"]
-            }
+            args += ["-color-diagnostics"]
         }
 
         // Add the output for the `.swiftinterface`, if requested.
@@ -667,6 +671,50 @@ public final class SwiftTargetBuildDescription {
         args += buildParameters.swiftCompilerFlags
         return args
     }
+
+    public func emitCommandLine() -> [String] {
+        var result: [String] = []
+        result.append(buildParameters.toolchain.swiftCompiler.pathString)
+
+        result.append("-module-name")
+        result.append(target.c99name)
+
+        result.append("-emit-dependencies")
+
+        // FIXME: Do we always have a module?
+        result.append("-emit-module")
+        result.append("-emit-module-path")
+        result.append(moduleOutputPath.pathString)
+
+        result.append("-output-file-map")
+        // FIXME: Eliminate side effect.
+        result.append(try! writeOutputFileMap().pathString)
+
+        switch target.type {
+        case .library, .test:
+            result.append("-parse-as-library")
+
+        case .executable, .systemModule, .binary:
+            do { }
+        }
+
+        if buildParameters.useWholeModuleOptimization {
+            result.append("-whole-module-optimization")
+            result.append("-num-threads")
+            result.append(String(ProcessInfo.processInfo.activeProcessorCount))
+        } else {
+            result.append("-incremental")
+        }
+
+        result.append("-c")
+        result.append(contentsOf: target.sources.paths.map { $0.pathString })
+
+        result.append("-I")
+        result.append(buildParameters.buildPath.pathString)
+
+        result += compileArguments()
+        return result
+     }
 
     /// Command-line for emitting just the Swift module.
     public func emitModuleCommandLine() -> [String] {
@@ -776,11 +824,16 @@ public final class SwiftTargetBuildDescription {
         stream <<< "{\n"
 
         let masterDepsPath = tempsPath.appending(component: "master.swiftdeps")
+        stream <<< "  \"\": {\n"
+        if buildParameters.useWholeModuleOptimization {
+            let moduleName = target.c99name
+            stream <<< "    \"dependencies\": \"" <<< tempsPath.appending(component: moduleName + ".d") <<< "\",\n"
+            // FIXME: Need to record this deps file for processing it later.
+            stream <<< "    \"object\": \"" <<< tempsPath.appending(component: moduleName + ".o") <<< "\",\n"
+        }
+        stream <<< "    \"swift-dependencies\": \"" <<< masterDepsPath.pathString <<< "\"\n"
 
-        stream <<< "  \"\": {\n";
-        // FIXME: Handle WMO
-        stream <<< "    \"swift-dependencies\": \"" <<< masterDepsPath.pathString <<< "\"\n";
-        stream <<< "  },\n";
+        stream <<< "  },\n"
 
         // Write out the entries for each source file.
         let sources = target.sources.paths
@@ -789,26 +842,29 @@ public final class SwiftTargetBuildDescription {
             let objectDir = object.parentDirectory
 
             let sourceFileName = source.basenameWithoutExt
-            let partialModulePath = objectDir.appending(component: sourceFileName + "~partial.swiftmodule")
 
             let swiftDepsPath = objectDir.appending(component: sourceFileName + ".swiftdeps")
 
             stream <<< "  \"" <<< source.pathString <<< "\": {\n"
-            // FIXME: Handle WMO
-            let depsPath = objectDir.appending(component: sourceFileName + ".d")
-            stream <<< "    \"dependencies\": \"" <<< depsPath.pathString <<< "\",\n"
-            // FIXME: Need to record this deps file for processing it later.
+
+            if (!buildParameters.useWholeModuleOptimization) {
+                let depsPath = objectDir.appending(component: sourceFileName + ".d")
+                stream <<< "    \"dependencies\": \"" <<< depsPath.pathString <<< "\",\n"
+                // FIXME: Need to record this deps file for processing it later.
+            }
 
             stream <<< "    \"object\": \"" <<< object.pathString <<< "\",\n"
-            stream <<< "    \"swiftmodule\": \"" <<< partialModulePath.pathString <<< "\",\n";
-            stream <<< "    \"swift-dependencies\": \"" <<< swiftDepsPath.pathString <<< "\"\n";
+
+            let partialModulePath = objectDir.appending(component: sourceFileName + "~partial.swiftmodule")
+            stream <<< "    \"swiftmodule\": \"" <<< partialModulePath.pathString <<< "\",\n"
+            stream <<< "    \"swift-dependencies\": \"" <<< swiftDepsPath.pathString <<< "\"\n"
             stream <<< "  }" <<< ((idx + 1) < sources.count ? "," : "") <<< "\n"
         }
 
         stream <<< "}\n"
 
-        try localFileSystem.createDirectory(path.parentDirectory, recursive: true)
-        try localFileSystem.writeFileContents(path, bytes: stream.bytes)
+        try fs.createDirectory(path.parentDirectory, recursive: true)
+        try fs.writeFileContents(path, bytes: stream.bytes)
         return path
     }
 
@@ -1203,7 +1259,7 @@ public class BuildPlan {
         _ buildParameters: BuildParameters,
         _ graph: PackageGraph
     ) throws -> [(ResolvedProduct, SwiftTargetBuildDescription)] {
-        guard buildParameters.triple.isLinux() else {
+        guard !buildParameters.triple.isDarwin() else {
             return []
         }
 
@@ -1296,7 +1352,8 @@ public class BuildPlan {
                 targetMap[target] = try .clang(ClangTargetBuildDescription(
                     target: target,
                     buildParameters: buildParameters,
-                    fileSystem: fileSystem))
+                    fileSystem: fileSystem,
+                    diagnostics: diagnostics))
             case is SystemLibraryTarget, is BinaryTarget:
                  break
             default:
@@ -1528,7 +1585,7 @@ public class BuildPlan {
             }
         }
 
-        if buildParameters.triple.isLinux() {
+        if !buildParameters.triple.isDarwin() {
             if product.type == .test {
                 linuxMainMap[product].map{ staticTargets.append($0) }
             }
@@ -1711,9 +1768,9 @@ public class BuildPlan {
                 return nil
             }
 
-            // Check that it supports macOS.
+            // Check that it supports the target platform and architecture.
             guard let library = info.libraries.first(where: {
-                $0.platform == "macos" && $0.architectures.contains(Triple.Arch.x86_64.rawValue)
+                return $0.platform == buildParameters.triple.os.asXCFrameworkPlatformString && $0.architectures.contains(buildParameters.triple.arch.rawValue)
             }) else {
                 diagnostics.emit(error: """
                     artifact '\(target.name)' does not support the target platform and architecture \
@@ -1832,4 +1889,16 @@ private func generateResourceInfoPlist(
 
     try fileSystem.writeIfChanged(path: path, bytes: stream.bytes)
     return true
+}
+
+fileprivate extension Triple.OS {
+    /// Returns a representation of the receiver that can be compared with platform strings declared in an XCFramework.
+    var asXCFrameworkPlatformString: String? {
+        switch self {
+        case .darwin, .linux, .wasi, .windows:
+            return nil // XCFrameworks do not support any of these platforms today.
+        case .macOS:
+            return "macos"
+        }
+    }
 }

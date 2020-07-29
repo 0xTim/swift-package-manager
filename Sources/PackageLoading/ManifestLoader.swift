@@ -63,6 +63,7 @@ public protocol ManifestLoaderProtocol {
     ///   - path: The root path of the package.
     ///   - baseURL: The URL the manifest was loaded from.
     ///   - version: The version the manifest is from, if known.
+    ///   - revision: The revision the manifest is from, if known.
     ///   - toolsVersion: The version of the tools the manifest supports.
     ///   - kind: The kind of package the manifest is from.
     ///   - fileSystem: If given, the file system to load from (otherwise load from the local file system).
@@ -71,6 +72,7 @@ public protocol ManifestLoaderProtocol {
         packagePath path: AbsolutePath,
         baseURL: String,
         version: Version?,
+        revision: String?,
         toolsVersion: ToolsVersion,
         packageKind: PackageReference.Kind,
         fileSystem: FileSystem?,
@@ -85,6 +87,7 @@ extension ManifestLoaderProtocol {
     ///   - path: The root path of the package.
     ///   - baseURL: The URL the manifest was loaded from.
     ///   - version: The version the manifest is from, if known.
+    ///   - revision: The revision the manifest is from, if known.
     ///   - toolsVersion: The version of the tools the manifest supports.
     ///   - kind: The kind of package the manifest is from.
     ///   - fileSystem: If given, the file system to load from (otherwise load from the local file system).
@@ -93,6 +96,7 @@ extension ManifestLoaderProtocol {
         package path: AbsolutePath,
         baseURL: String,
         version: Version? = nil,
+        revision: String? = nil,
         toolsVersion: ToolsVersion,
         packageKind: PackageReference.Kind,
         fileSystem: FileSystem? = nil,
@@ -102,6 +106,7 @@ extension ManifestLoaderProtocol {
             packagePath: path,
             baseURL: baseURL,
             version: version,
+            revision: revision,
             toolsVersion: toolsVersion,
             packageKind: packageKind,
             fileSystem: fileSystem,
@@ -190,6 +195,7 @@ public final class ManifestLoader: ManifestLoaderProtocol {
         packagePath path: AbsolutePath,
         baseURL: String,
         version: Version?,
+        revision: String?,
         toolsVersion: ToolsVersion,
         packageKind: PackageReference.Kind,
         fileSystem: FileSystem? = nil,
@@ -199,6 +205,7 @@ public final class ManifestLoader: ManifestLoaderProtocol {
             path: Manifest.path(atPackagePath: path, fileSystem: fileSystem ?? localFileSystem),
             baseURL: baseURL,
             version: version,
+            revision: revision,
             toolsVersion: toolsVersion,
             packageKind: packageKind,
             fileSystem: fileSystem,
@@ -212,12 +219,14 @@ public final class ManifestLoader: ManifestLoaderProtocol {
     ///   - path: The path to the manifest file (or a package root).
     ///   - baseURL: The URL the manifest was loaded from.
     ///   - version: The version the manifest is from, if known.
+    ///   - revision: The revision the manifest is from, if known.
     ///   - kind: The kind of package the manifest is from.
     ///   - fileSystem: If given, the file system to load from (otherwise load from the local file system).
     func loadFile(
         path inputPath: AbsolutePath,
         baseURL: String,
         version: Version?,
+        revision: String?,
         toolsVersion: ToolsVersion,
         packageKind: PackageReference.Kind,
         fileSystem: FileSystem? = nil,
@@ -257,6 +266,25 @@ public final class ManifestLoader: ManifestLoaderProtocol {
             throw ManifestParseError.runtimeManifestErrors(manifestBuilder.errors)
         }
 
+        // Convert legacy system packages to the current target‐based model.
+        var products =  manifestBuilder.products
+        var targets = manifestBuilder.targets
+        if products.isEmpty, targets.isEmpty,
+            (fileSystem ?? localFileSystem).isFile(inputPath.parentDirectory.appending(component: moduleMapFilename)) {
+                products.append(ProductDescription(
+                name: manifestBuilder.name,
+                type: .library(.automatic),
+                targets: [manifestBuilder.name])
+            )
+            targets.append(TargetDescription(
+                name: manifestBuilder.name,
+                path: "",
+                type: .system,
+                pkgConfig: manifestBuilder.pkgConfig,
+                providers: manifestBuilder.providers
+            ))
+        }
+
         let manifest = Manifest(
             name: manifestBuilder.name,
             defaultLocalization: manifestBuilder.defaultLocalization,
@@ -264,6 +292,7 @@ public final class ManifestLoader: ManifestLoaderProtocol {
             path: inputPath,
             url: baseURL,
             version: version,
+            revision: revision,
             toolsVersion: toolsVersion,
             packageKind: packageKind,
             pkgConfig: manifestBuilder.pkgConfig,
@@ -272,8 +301,8 @@ public final class ManifestLoader: ManifestLoaderProtocol {
             cxxLanguageStandard: manifestBuilder.cxxLanguageStandard,
             swiftLanguageVersions: manifestBuilder.swiftLanguageVersions,
             dependencies: manifestBuilder.dependencies,
-            products: manifestBuilder.products,
-            targets: manifestBuilder.targets
+            products: products,
+            targets: targets
         )
 
         try validate(manifest, toolsVersion: toolsVersion, diagnostics: diagnostics)
@@ -489,10 +518,12 @@ public final class ManifestLoader: ManifestLoaderProtocol {
         /// For e.g., we could have failed to spawn the process or create temporary file.
         var errorOutput: String? {
             didSet {
-                assert(parsedManifest == nil && compilerOutput == nil)
+                assert(parsedManifest == nil)
             }
         }
     }
+
+    private static var _packageDescriptionMinimumDeploymentTarget: String?
 
     /// Parse the manifest at the given path to JSON.
     fileprivate func parse(
@@ -531,6 +562,7 @@ public final class ManifestLoader: ManifestLoaderProtocol {
             cmd += [resources.swiftCompiler.pathString]
             cmd += verbosity.ccArgs
 
+            let macOSPackageDescriptionPath: AbsolutePath
             // If we got the binDir that means we could be developing SwiftPM in Xcode
             // which produces a framework for dynamic package products.
             let packageFrameworkPath = runtimePath.appending(component: "PackageFrameworks")
@@ -540,13 +572,27 @@ public final class ManifestLoader: ManifestLoaderProtocol {
                     "-framework", "PackageDescription",
                     "-Xlinker", "-rpath", "-Xlinker", packageFrameworkPath.pathString,
                 ]
+
+                macOSPackageDescriptionPath = packageFrameworkPath.appending(RelativePath("PackageDescription.framework/PackageDescription"))
             } else {
                 cmd += [
                     "-L", runtimePath.pathString,
                     "-lPackageDescription",
                     "-Xlinker", "-rpath", "-Xlinker", runtimePath.pathString
                 ]
+
+                // note: this is not correct for all platforms, but we only actually use it on macOS.
+                macOSPackageDescriptionPath = runtimePath.appending(RelativePath("libPackageDescription.dylib"))
             }
+
+            // Use the same minimum deployment target as the PackageDescription library (with a fallback of 10.15).
+            #if os(macOS)
+            if Self._packageDescriptionMinimumDeploymentTarget == nil {
+                Self._packageDescriptionMinimumDeploymentTarget = (try MinimumDeploymentTarget.computeMinimumDeploymentTarget(of: macOSPackageDescriptionPath))?.versionString ?? "10.15"
+            }
+            let version = Self._packageDescriptionMinimumDeploymentTarget!
+            cmd += ["-target", "x86_64-apple-macosx\(version)"]
+            #endif
 
             cmd += compilerFlags
             if let moduleCachePath = moduleCachePath {
@@ -566,8 +612,8 @@ public final class ManifestLoader: ManifestLoaderProtocol {
 
             try withTemporaryDirectory(removeTreeOnDeinit: true) { tmpDir in
                 // Set path to compiled manifest executable.
-                let file = tmpDir.appending(components: "\(packageIdentity)-manifest")
-                cmd += ["-o", file.pathString]
+                let compiledManifestFile = tmpDir.appending(component: "\(packageIdentity)-manifest")
+                cmd += ["-o", compiledManifestFile.pathString]
 
                 // Compile the manifest.
                 let compilerResult = try Process.popen(arguments: cmd)
@@ -578,9 +624,13 @@ public final class ManifestLoader: ManifestLoaderProtocol {
                 if compilerResult.exitStatus != .terminated(code: 0) {
                     return
                 }
-
-                // Pass the fd in arguments.
-                cmd = [file.pathString, "-fileno", "1"]
+                
+                // Pass an open file descriptor of a file to which the JSON representation of the manifest will be written.
+                let jsonOutputFile = tmpDir.appending(component: "\(packageIdentity)-output.json")
+                guard let jsonOutputFileDesc = fopen(jsonOutputFile.pathString, "w") else {
+                    throw StringError("couldn't create the manifest's JSON output file")
+                }
+                cmd = [compiledManifestFile.pathString, "-fileno", "\(fileno(jsonOutputFileDesc))"]
 
               #if os(macOS)
                 // If enabled, use sandbox-exec on macOS. This provides some safety against
@@ -596,9 +646,14 @@ public final class ManifestLoader: ManifestLoaderProtocol {
                 }
               #endif
 
-                // Run the command.
+                // Run the compiled manifest.
                 let runResult = try Process.popen(arguments: cmd)
+                fclose(jsonOutputFileDesc)
                 let runOutput = try (runResult.utf8Output() + runResult.utf8stderrOutput()).spm_chuzzle()
+                if let runOutput = runOutput {
+                    // Append the runtime output to any compiler output we've received.
+                    manifestParseResult.compilerOutput = (manifestParseResult.compilerOutput ?? "") + runOutput
+                }
 
                 // Return now if there was an error.
                 if runResult.exitStatus != .terminated(code: 0) {
@@ -606,7 +661,11 @@ public final class ManifestLoader: ManifestLoaderProtocol {
                     return
                 }
 
-                manifestParseResult.parsedManifest = runOutput
+                // Read the JSON output that was emitted by libPackageDescription.
+                guard let jsonOutput = try localFileSystem.readFileContents(jsonOutputFile).validDescription else {
+                    throw StringError("the manifest's JSON output has invalid encoding")
+                }
+                manifestParseResult.parsedManifest = jsonOutput
             }
         }
 
@@ -667,7 +726,6 @@ public final class ManifestLoader: ManifestLoaderProtocol {
         cmd += ["-swift-version", toolsVersion.swiftLanguageVersion.rawValue]
         cmd += ["-I", runtimePath.pathString]
       #if os(macOS)
-        cmd += ["-target", "x86_64-apple-macosx10.10"]
         if let sdkRoot = resources.sdkRoot ?? self.sdkRoot() {
             cmd += ["-sdk", sdkRoot.pathString]
         }

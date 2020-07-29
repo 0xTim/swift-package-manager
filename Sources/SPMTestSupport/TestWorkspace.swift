@@ -72,6 +72,10 @@ public final class TestWorkspace {
         return sandbox.appending(component: "pkgs")
     }
 
+    public var artifactsDir: AbsolutePath {
+        return sandbox.appending(components: ".build", "artifacts")
+    }
+
     public func urlForPackage(withName name: String) -> String {
         return packagesDir.appending(RelativePath(name)).pathString
     }
@@ -188,16 +192,19 @@ public final class TestWorkspace {
 
         public let name: String
         public let requirement: Requirement
+        public let products: ProductFilter
 
-        public init(name: String, requirement: Requirement) {
+        public init(name: String, requirement: Requirement, products: ProductFilter) {
             self.name = name
             self.requirement = requirement
+            self.products = products
         }
 
         fileprivate func convert(_ packagesDir: AbsolutePath, url: String) -> PackageGraphRootInput.PackageDependency {
             return PackageGraphRootInput.PackageDependency(
                 url: url,
                 requirement: requirement,
+                productFilter: products,
                 location: name
             )
         }
